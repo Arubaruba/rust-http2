@@ -1,0 +1,11 @@
+[package]
+
+name = "http2"
+version = "0.0.1"
+authors = [ "Andreas Stocker <shadowstep7@gmail.com>" ]
+
+[lib]
+name = "http2"
+
+[[bin.simple_server]]
+path = "examples/simple_server.rs"
