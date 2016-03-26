@@ -1,7 +1,5 @@
 use std::collections::HashMap;
-use std::io;
-use std::str;
-use std::u8;
+use std::{str, u8};
 
 #[derive(Eq, PartialEq, Debug)]
 pub struct HttpVersion {
@@ -11,66 +9,125 @@ pub struct HttpVersion {
 
 #[derive(Eq, PartialEq, Debug)]
 pub struct Request<'a> {
-    pub method: &'a str,
+    pub method: Method,
     pub url: &'a str,
     pub version: HttpVersion,
 
     // Header names are lowercased so we need a String to modify them
-    pub headers: HashMap<String, &'a str>,
+    pub headers: HashMap<String, String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ParserError {
-    IOError(io::Error),
-    Uft8Error(str::Utf8Error),
-    InvalidFormat {
-        line: usize,
-    },
+    InvalidFormat,
+    InvalidHeader(String),
     InvalidHttpVersion,
+    InvalidInitialLine(String),
+    Uft8Error(str::Utf8Error),
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub enum Method {
+    DELETE,
+    GET,
+    POST,
+    PUT,
+    UPDATE,
+    UNSUPPORTED(String),
+}
+
+impl From<str::Utf8Error> for ParserError {
+    fn from(err: str::Utf8Error) -> Self {
+        ParserError::Uft8Error(err)
+    }
 }
 
 impl<'b> Request<'b> {
-    pub fn from_str<'a>(text: &'a str) -> Result<Request<'a>, ParserError> {
-        use self::ParserError::InvalidFormat;
+    pub fn from_str<'a>(request_text: &'a str) -> Result<Request<'a>, ParserError> {
+        use self::ParserError::*;
 
-        let mut lines = text.lines();
+        // Parse the initial line
+        let mut split_at_initial_line = request_text.splitn(2, '\n');
+        let initial_line = try!(split_at_initial_line.next()
+                                                     .ok_or(InvalidInitialLine(String::new())));
 
-        let mut initial_line = try!(lines.next().ok_or(InvalidFormat { line: 1 }))
-                                   .split_whitespace();
+        let (method, url, version) = try!(match initial_line.split_whitespace()
+                                                            .collect::<Vec<_>>()
+                                                            .as_slice() {
+            [method, url, version] => {
+                use self::Method::*;
 
-        let method = try!(initial_line.next().ok_or(InvalidFormat { line: 1 }));
-        let url = try!(initial_line.next().ok_or(InvalidFormat { line: 1 }));
-        let version_text = try!(initial_line.next().ok_or(InvalidFormat { line: 1 }));
-        let version = try!(Request::parse_version(version_text));
+                let method = match method {
+                    "DELETE" => DELETE,
+                    "GET" => GET,
+                    "POST" => POST,
+                    "PUT" => PUT,
+                    "UPDATE" => UPDATE,
+                    _ => UNSUPPORTED(method.to_string()),
+                };
 
-        let mut headers = HashMap::new();
-
-        // Parse headers
-        for (line_number, header_line) in lines.enumerate() {
-			// The last line is purposefully empty
-            if header_line.len() > 0 {
-                let mut header_parts = header_line.split(":");
-                // Add 2 to the line number because line number zero should be labeled as line 2 (counting the initial line)
-                let name = try!(header_parts.next().ok_or(InvalidFormat { line: line_number + 2 }))
-                               .trim();
-                let value = try!(header_parts.next()
-                                             .ok_or(InvalidFormat { line: line_number + 2 }))
-                                .trim_left();
-
-
-                // Header names should always be lowercased
-                headers.insert(name.to_lowercase(), value);
-            } else {
-            	break;
+                Ok((method, url, try!(Request::parse_version(version))))
             }
-        }
+            _ => Err(InvalidInitialLine(initial_line.to_string())),
+        });
+
+        let remaining_request = try!(split_at_initial_line.next().ok_or(InvalidFormat));
+
+        let empty_line = if initial_line.ends_with('\r') {
+            "\r\n\r\n"
+        } else {
+            "\n\n"
+        };
+
+        let mut split_at_empty_line = remaining_request.splitn(2, empty_line);
+
+        let header_text = try!(split_at_empty_line.next().ok_or(InvalidFormat));
 
         Ok(Request {
             method: method,
             url: url,
             version: version,
-            headers: headers,
+            headers: try!(Request::parse_headers(header_text)),
         })
+    }
+
+    fn parse_headers<'a>(header_text: &'a str) -> Result<HashMap<String, String>, ParserError> {
+        use self::ParserError::InvalidHeader;
+
+        let mut header_lines = header_text.lines().peekable();
+
+        let mut headers = HashMap::<String, String>::new();
+
+        while let Some(line) = header_lines.next() {
+            // If this line in a continuation of another header value ignore it
+            if line.trim_left().len() == line.len() {
+                let err = InvalidHeader(line.to_string());
+
+                let mut parts = line.splitn(2, ':');
+                let name = try!(parts.next().ok_or(err.clone())).trim_right().to_lowercase();
+                let value = try!(parts.next().ok_or(err.clone())).trim_left();
+
+                let value_continuation = if let Some(next_header) = header_lines.peek() {
+                    // If the next header begins with whitespace it should be
+                    // interpreted as a continuation of the previous header's value
+                    if next_header.trim_left().len() != next_header.len() {
+                        Some(next_header.trim_left())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(value_continuation) = value_continuation {
+                    headers.insert(name, value.to_string() + " " + value_continuation);
+                } else {
+                    headers.insert(name, value.to_string());
+                }
+            }
+        }
+
+        Ok(headers)
     }
 
     fn parse_version<'a>(text: &'a str) -> Result<HttpVersion, ParserError> {
@@ -98,15 +155,15 @@ impl<'b> Request<'b> {
 mod tests {
     use super::*;
 
-    const RAW_REQUEST: &'static str = "GET 	/test/1234  HTTP/1.1\n  Header1 : it\n  Header2:   \
+    const RAW_REQUEST: &'static str = "GET 	/test/1234  HTTP/1.1\nHeader1 : it\nHeader2:   \
                                        works  \n\n";
 
     #[test]
     fn parse_request() {
 
-        let request = Request::from_str(&RAW_REQUEST).unwrap();
+        let request = Request::from_str(RAW_REQUEST).unwrap();
         // The initial line
-        assert_eq!(request.method, "GET");
+        assert_eq!(request.method, Method::GET);
         assert_eq!(request.url, "/test/1234");
         assert_eq!(request.version,
                    HttpVersion {
@@ -115,9 +172,18 @@ mod tests {
                    });
 
         // Parser should handle spaces correctly and also make all headers lowercased
-        assert_eq!(request.headers.get("header1"), Some(&"it"));
+        assert_eq!(request.headers.get("header1"), Some(&"it".to_string()));
         // Note that spaces at the end of header values are preserved
-        assert_eq!(request.headers.get("header2"), Some(&"works  "));
+        assert_eq!(request.headers.get("header2"), Some(&"works  ".to_string()));
+    }
+
+    #[test]
+    fn parser_headers() {
+        let header_text = "Header1: 1234\nHeader2 : the\n	 fox jumped";
+        let headers = Request::parse_headers(header_text).unwrap();
+
+        assert_eq!(headers.get("header1"), Some(&"1234".to_string()));
+        assert_eq!(headers.get("header2"), Some(&"the fox jumped".to_string()));
     }
 
     #[test]
